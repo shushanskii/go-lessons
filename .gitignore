@@ -1,0 +1,6 @@
+/go-lessons
+/go-lessons.exe
+
+# артефакты замеров и снимков
+/tmp/
+*.txt.bak

@@ -1,0 +1,2 @@
+title: Срезы: len, append и range
+kind: snippet
