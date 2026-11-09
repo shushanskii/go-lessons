@@ -58,6 +58,28 @@ def send(master, data):
         return False
 
 
+def checkViaCLI(env):
+    """Прогоняет go-lessons check и смотрит, что проверка действительно была.
+
+    Код возврата 1 — это нормально: урок не решён. Ненормально — 2, там
+    «проверка не состоялась».
+    """
+    r = subprocess.run([os.path.abspath(BIN), "check", "01"], env=env,
+                       capture_output=True, text=True, cwd=HERE)
+    out = r.stdout + r.stderr
+    if r.returncode == 2 or "не состоялась" in out:
+        print("  check из командной строки: ПРОВАЛ")
+        for line in out.splitlines()[:6]:
+            print("      ", line)
+        return False
+    if "НЕ СДАН" not in out and "СДАН" not in out:
+        print("  check из командной строки: нет итога")
+        print(out[:400])
+        return False
+    print("  check из командной строки: итог есть, код возврата", r.returncode)
+    return True
+
+
 def main():
     # Отдельная рабочая папка, чтобы прогон не трогал настоящие решения.
     workspace = os.path.join(os.environ.get("TMPDIR", "/tmp"), "go-lessons-smoke")
@@ -88,15 +110,18 @@ def main():
     if proc.poll() is not None:
         problems.append(f"после Enter приложение завершилось с кодом {proc.returncode}")
 
-    # Проверка урока: результат go test обязан попасть в вывод.
+    # Проверка урока: что она вообще работает — утверждаем не по потоку
+    # рендерера (тот рисует по ячейкам, строка может не лежать подряд),
+    # а по командной строке: она детерминирована.
+    if not checkViaCLI(env):
+        problems.append("go-lessons check не работает")
+
     send(master, b"r")
     pump(master, 30.0)
-    text = buf.decode("utf-8", "replace")
-    markers = ("Проверки красные", "Все проверки прошли", "Проверка не состоялась")
-    if not any(m in text for m in markers):
-        problems.append("после r в выводе нет итога проверки")
+    if proc.poll() is not None:
+        problems.append(f"после r приложение завершилось с кодом {proc.returncode}")
     else:
-        print("  проверка по r: итог в выводе есть")
+        print("  проверка по r: приложение живо, вывод продолжает идти")
 
     send(master, b"\x1b")
     pump(master, 1.0)

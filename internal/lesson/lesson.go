@@ -3,7 +3,6 @@ package lesson
 
 import (
 	"fmt"
-	"go/format"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -11,40 +10,27 @@ import (
 	"strings"
 )
 
-// Kind определяет, как студент пишет код.
-type Kind string
-
+// Имена файлов внутри урока. Суффикс _test.go — не соглашение стиля, а
+// механизм: go test берёт только файлы с таким окончанием.
 const (
-	// KindSnippet — маленькое поле ввода прямо в интерфейсе.
-	KindSnippet Kind = "snippet"
-	// KindProject — файлы в рабочей папке, правятся внешним редактором.
-	KindProject Kind = "project"
-)
-
-// Файлы со служебными именами не попадают в рабочую папку студента.
-const (
+	FileTheory = "lesson.md"
+	FileTasks  = "tasks.go"
+	FileTests  = "tasks_test.go"
 	fileMeta   = "meta.txt"
-	fileTheory = "lesson.md"
-
-	// EditableFile — файл, который редактирует поле ввода в режиме snippet.
-	EditableFile = "solution.go"
 )
 
 // Урок — это теория, задание и набор файлов для проверки.
 type Lesson struct {
-	ID    string // имя каталога, например 01-variables
+	ID    string // имя каталога, например 01-basics
 	Title string
-	Kind  Kind
 	// Run — после тестов дополнительно выполнить go run и показать вывод.
 	Run bool
 	// Race — гонять тесты с -race. Для уроков про горутины это не роскошь:
 	// без детектора гонок тест проходит и на неверном коде.
 	Race bool
-	// Hint — подсказка, что открыть в редакторе (для KindProject).
-	Hint string
 	// Theory — текст урока в markdown.
 	Theory string
-	// Files — остальные файлы урока: заготовка и тесты.
+	// Files — все файлы урока, включая tasks.go и tasks_test.go.
 	Files map[string][]byte
 }
 
@@ -80,17 +66,15 @@ func Load(fsys fs.FS) (*Registry, error) {
 		reg.All = append(reg.All, l)
 	}
 	if len(reg.All) == 0 {
-		return nil, fmt.Errorf("в lessons нет ни одного урока")
+		return nil, fmt.Errorf("в уроках нет ни одного каталога")
 	}
 	return reg, nil
 }
 
 func readOne(fsys fs.FS, id string) (*Lesson, error) {
-	dir := id
+	l := &Lesson{ID: id, Files: map[string][]byte{}}
 
-	l := &Lesson{ID: id, Kind: KindProject, Files: map[string][]byte{}}
-
-	meta, err := fs.ReadFile(fsys, filepath.Join(dir, fileMeta))
+	meta, err := fs.ReadFile(fsys, filepath.Join(id, fileMeta))
 	if err != nil {
 		return nil, fmt.Errorf("нет %s: %w", fileMeta, err)
 	}
@@ -107,19 +91,10 @@ func readOne(fsys fs.FS, id string) (*Lesson, error) {
 		switch key {
 		case "title":
 			l.Title = val
-		case "kind":
-			switch Kind(val) {
-			case KindSnippet, KindProject:
-				l.Kind = Kind(val)
-			default:
-				return nil, fmt.Errorf("неизвестный kind %q, бывает snippet или project", val)
-			}
 		case "run":
 			l.Run = val == "yes" || val == "true"
 		case "race":
 			l.Race = val == "yes" || val == "true"
-		case "hint":
-			l.Hint = val
 		default:
 			return nil, fmt.Errorf("неизвестное поле %q в %s", key, fileMeta)
 		}
@@ -128,48 +103,47 @@ func readOne(fsys fs.FS, id string) (*Lesson, error) {
 		return nil, fmt.Errorf("в %s нет title", fileMeta)
 	}
 
-	theory, err := fs.ReadFile(fsys, filepath.Join(dir, fileTheory))
+	theory, err := fs.ReadFile(fsys, filepath.Join(id, FileTheory))
 	if err != nil {
-		return nil, fmt.Errorf("нет %s: %w", fileTheory, err)
+		return nil, fmt.Errorf("нет %s: %w", FileTheory, err)
 	}
 	l.Theory = string(theory)
 
-	err = fs.WalkDir(fsys, dir, func(p string, d fs.DirEntry, err error) error {
+	err = fs.WalkDir(fsys, id, func(p string, d fs.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
 			return err
 		}
-		name := d.Name()
-		if name == fileMeta || name == fileTheory {
+		if d.Name() == fileMeta || d.Name() == FileTheory {
 			return nil
 		}
 		b, err := fs.ReadFile(fsys, p)
 		if err != nil {
 			return err
 		}
-		l.Files[name] = b
+		l.Files[d.Name()] = b
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
 
-	if len(l.Files) == 0 {
-		return nil, fmt.Errorf("нет ни заготовки, ни тестов")
+	// Форма урока жёсткая: один вид уроков дешевле, чем два с развилками
+	// в интерфейсе и в проверках.
+	if _, ok := l.Files[FileTasks]; !ok {
+		return nil, fmt.Errorf("нет %s — файла, который правит студент", FileTasks)
 	}
-	if l.Kind == KindSnippet {
-		if _, ok := l.Files[EditableFile]; !ok {
-			return nil, fmt.Errorf("режим snippet требует %s", EditableFile)
-		}
-		if _, ok := l.Files[EditableFile+".txt"]; ok {
-			return nil, fmt.Errorf("служебный файл %s.txt не нужен", EditableFile)
-		}
+	if _, ok := l.Files[FileTests]; !ok {
+		return nil, fmt.Errorf("нет %s — нечем проверять результат", FileTests)
 	}
 	return l, nil
 }
 
-// Dir — папка урока внутри рабочей директории.
+// Dir — папка урока в рабочей директории.
+//
+// Уроки лежат в подкаталоге lessons/, чтобы рабочая папка оставалась
+// опрятной: рядом только .progress.json.
 func (l *Lesson) Dir(workspace string) string {
-	return filepath.Join(workspace, l.ID)
+	return filepath.Join(workspace, "lessons", l.ID)
 }
 
 // Unpack кладёт файлы урока в рабочую папку.
@@ -183,6 +157,18 @@ func (l *Lesson) Unpack(workspace string) (bool, error) {
 	}
 
 	created := false
+
+	// go.mod создаём здесь, а не храним в уроке. Причина измерена: go:embed
+	// пропускает каталог, в котором лежит go.mod, — для инструмента это чужой
+	// модуль. Без этого урока нельзя было бы вшить в бинарник.
+	if _, err := os.Stat(filepath.Join(dir, "go.mod")); os.IsNotExist(err) {
+		body := fmt.Sprintf("module golessons/%s\n\ngo 1.22\n", l.ID)
+		if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte(body), 0o644); err != nil {
+			return created, fmt.Errorf("не создать go.mod: %w", err)
+		}
+		created = true
+	}
+
 	for name, data := range l.Files {
 		path := filepath.Join(dir, name)
 		if _, err := os.Stat(path); err == nil {
@@ -196,36 +182,11 @@ func (l *Lesson) Unpack(workspace string) (bool, error) {
 	return created, nil
 }
 
-// ReadEditable — содержимое редактируемого файла для режима snippet.
-func (l *Lesson) ReadEditable(workspace string) (string, error) {
-	b, err := os.ReadFile(filepath.Join(l.Dir(workspace), EditableFile))
+// Read — содержимое файла урока из рабочей папки.
+func (l *Lesson) Read(workspace, name string) (string, error) {
+	b, err := os.ReadFile(filepath.Join(l.Dir(workspace), name))
 	if err != nil {
 		return "", err
 	}
 	return string(b), nil
-}
-
-// WriteEditable сохраняет поле ввода обратно в файл.
-//
-// Форматирует его по дороге. Поле ввода в bubbles разворачивает табы в
-// четыре пробела, а gofmt живёт табами: без этого каждый сохранённый snippet
-// приезжал бы в файл неотформатированным, и первая же жалоба студента
-// звучала бы как «мне исправили код».
-//
-// Неформатируемый код (не хватает скобки) пишется как есть: студенту нужнее
-// собственная опечатка, чем молча потерянное редактирование.
-func (l *Lesson) WriteEditable(workspace, content string) error {
-	out := content
-	if formatted, err := format.Source([]byte(content)); err == nil {
-		out = string(formatted)
-	}
-	return os.WriteFile(filepath.Join(l.Dir(workspace), EditableFile), []byte(out), 0o644)
-}
-
-// Status — короткий текст о уроке для списка.
-func (l *Lesson) Status() string {
-	if l.Kind == KindSnippet {
-		return "поле ввода"
-	}
-	return "внешний редактор"
 }

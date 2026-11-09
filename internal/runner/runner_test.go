@@ -76,9 +76,89 @@ func TestInfiniteLoopIsKilled(t *testing.T) {
 	if !rep.TimedOut {
 		t.Errorf("не помечено как превышение времени: %s", dump(rep))
 	}
-	// Таймаут 5s на шаг; если висит дольше ~20s — группа процессов не убилась.
+	// Таймаут 5s на шаг; если висит дольше ~25s — группа процессов не убилась.
 	if took > 25*time.Second {
 		t.Errorf("убийство затянулось: %s — похоже, группа процессов осталась жива", took)
+	}
+}
+
+// Координаты нужны для перехода в редактор по клавише g.
+func TestProblemsAreLocated(t *testing.T) {
+	dir := module(t)
+	write(t, dir, "a.go", "package probe\n\nfunc Bad( {\n")
+
+	rep := Check(context.Background(), Options{Dir: dir})
+	if rep.OK {
+		t.Fatal("код с синтаксической ошибкой прошёл проверку")
+	}
+	if len(rep.Steps) == 0 || len(rep.Steps[0].Problems) == 0 {
+		t.Fatalf("нет координат ошибки:\n%s", dump(rep))
+	}
+
+	p := rep.Steps[0].Problems[0]
+	if p.File != "a.go" {
+		t.Errorf("файл %q, ждали a.go", p.File)
+	}
+	if p.Line == 0 {
+		t.Errorf("строки нет: %+v", p)
+	}
+	if !strings.Contains(p.String(), "a.go:3") {
+		t.Errorf("вид не тот: %q", p.String())
+	}
+}
+
+// Счётчик тестов — ради него всё и затевалось: «не сдан» бесполезно,
+// а «падает 2 из 5» говорит студенту, что уже хорошо.
+func TestCountsPerTest(t *testing.T) {
+	dir := module(t)
+	write(t, dir, "a.go", "package probe\n\nfunc Two() int { return 2 }\n")
+	write(t, dir, "a_test.go", "package probe\n\nimport \"testing\"\n\n"+
+		"func TestGood(t *testing.T) {\n\tif Two() != 2 { t.Fatal(\"нет\") }\n}\n\n"+
+		"func TestBad(t *testing.T) {\n\tif Two() != 3 {\n\t\tt.Errorf(\"Two() = %d, хотим 3\", Two())\n\t}\n}\n")
+
+	rep := Check(context.Background(), Options{Dir: dir})
+	if rep.OK {
+		t.Error("падающий тест прошёл как успешный")
+	}
+	if rep.Passed != 1 || rep.Failed != 1 {
+		t.Errorf("счётчик %+v/%+v, ждали 1/1:\n%s", rep.Passed, rep.Failed, dump(rep))
+	}
+	if len(rep.Tests) != 2 {
+		t.Errorf("тестов найдено %d, ждали 2", len(rep.Tests))
+	}
+
+	var where *Problem
+	for _, tr := range rep.Tests {
+		if tr.Name == "TestBad" {
+			where = tr.Where
+		}
+	}
+	if where == nil || where.File != "a_test.go" || where.Line == 0 {
+		t.Errorf("у падающего теста нет координат: %+v", where)
+	}
+}
+
+// Паника вне тестов (дедлок, незакрытый канал) обязана дойти до студента,
+// а не превратиться в «ни одного теста».
+func TestPanicIsReported(t *testing.T) {
+	dir := module(t)
+	write(t, dir, "a.go", "package probe\n\nfunc Wait() int {\n\tc := make(chan int)\n\treturn <-c\n}\n")
+	write(t, dir, "a_test.go", "package probe\n\nimport \"testing\"\n\n"+
+		"func TestWait(t *testing.T) {\n\t_ = Wait()\n}\n")
+
+	rep := Check(context.Background(), Options{Dir: dir, Timeout: 40 * time.Second})
+	if rep.OK {
+		t.Error("вечное ожидание канала прошло проверку")
+	}
+	if len(rep.Steps) < 2 {
+		t.Fatalf("до тестов не дошло:\n%s", dump(rep))
+	}
+	tests := rep.Steps[1]
+	if tests.OK {
+		t.Error("шаг тестов зелёный при зависшем тесте")
+	}
+	if !strings.Contains(tests.Output, "deadlock") && !strings.Contains(tests.Output, "panic") {
+		t.Errorf("в выводе нет ни deadlock, ни panic:\n%s", tests.Output)
 	}
 }
 

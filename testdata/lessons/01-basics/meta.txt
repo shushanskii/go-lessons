@@ -1,2 +1,1 @@
 title: Переменные, функции и :=
-kind: snippet

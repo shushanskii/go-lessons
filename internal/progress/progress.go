@@ -11,9 +11,14 @@ import (
 
 // Record — состояние одного урока.
 type Record struct {
-	Done     bool      `json:"done"`
-	Attempts int       `json:"attempts"`
-	LastAt   time.Time `json:"last_at,omitempty"`
+	Done bool `json:"done"`
+	// Attempts — сколько раз запускали проверку, а не сколько раз решали.
+	Attempts int `json:"attempts"`
+	// Passed и Failed — сколько проверок прошло и упало на последнем прогоне.
+	// Именно это превращает «не сдан» в «не сдан, 3 из 5».
+	Passed int       `json:"passed"`
+	Failed int       `json:"failed"`
+	LastAt time.Time `json:"last_at,omitempty"`
 }
 
 // Store — прогресс на диске. Формат — обычный JSON: его видно глазами,
@@ -56,13 +61,16 @@ func (s *Store) Get(id string) Record {
 	return s.Lessons[id]
 }
 
-// Pass отмечает урок сданным и увеличивает счётчик попыток.
+// Pass записывает результат проверки.
 //
-// Попытка засчитывается всегда, сданным — только когда проверки зелёные.
-func (s *Store) Pass(id string, ok bool) error {
+// Попытка засчитывается всегда, сданным урок становится только когда все
+// проверки зелёные и ни один тест не упал.
+func (s *Store) Pass(id string, ok bool, passed, failed int) error {
 	r := s.Lessons[id]
 	r.Attempts++
 	r.LastAt = time.Now()
+	r.Passed = passed
+	r.Failed = failed
 	if ok {
 		r.Done = true
 	}

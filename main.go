@@ -56,9 +56,6 @@ func main() {
 	if err := os.MkdirAll(workspace, 0o755); err != nil {
 		die(fmt.Errorf("не создать рабочую папку %s: %w", workspace, err))
 	}
-	if err := ensureModule(workspace); err != nil {
-		die(err)
-	}
 
 	store, err := progress.Open(filepath.Join(workspace, ".progress.json"))
 	if err != nil {
@@ -88,6 +85,7 @@ const usage = `go-lessons — интерактивный тренажёр Go в 
 Команды:
   list              список уроков и прогресс
   check <id>        проверить урок без интерфейса, код возврата 0 если сдан
+  check --all       проверить все уроки
   help              этот текст
 
 Флаги:
@@ -112,6 +110,11 @@ func cmdList(reg *lesson.Registry, store *progress.Store, workspace string) {
 }
 
 func cmdCheck(reg *lesson.Registry, store *progress.Store, workspace, id string) {
+	if id == "--all" || id == "all" {
+		cmdCheckAll(reg, store, workspace)
+		return
+	}
+
 	l := find(reg, id)
 	if l == nil {
 		die(fmt.Errorf("нет урока %q — список покажет go-lessons list", id))
@@ -125,7 +128,7 @@ func cmdCheck(reg *lesson.Registry, store *progress.Store, workspace, id string)
 		AlsoRun: l.Run,
 		Race:    l.Race,
 	})
-	_ = store.Pass(l.ID, rep.OK)
+	_ = store.Pass(l.ID, rep.OK, rep.Passed, rep.Failed)
 
 	if rep.Fatal != "" {
 		fmt.Fprintln(os.Stderr, rep.Fatal)
@@ -136,13 +139,65 @@ func cmdCheck(reg *lesson.Registry, store *progress.Store, workspace, id string)
 		if s.OK {
 			mark = "ok  "
 		}
-		fmt.Printf("%s  %-8s %6s\n", mark, s.Name, s.Elapsed.Round(time.Millisecond))
-		if !s.OK && strings.TrimSpace(s.Output) != "" {
-			fmt.Println(indent(s.Output, "      "))
+		fmt.Printf("%s  %-16s %6s\n", mark, s.Name, s.Elapsed.Round(time.Millisecond))
+		for _, p := range s.Problems {
+			fmt.Println("        " + p.String())
 		}
+		if !s.OK && len(s.Problems) == 0 && strings.TrimSpace(s.Output) != "" {
+			fmt.Println(indent(s.Output, "        "))
+		}
+	}
+	for _, tr := range rep.Tests {
+		sign := "ok  "
+		if tr.Status == "fail" {
+			sign = "FAIL"
+		} else if tr.Status == "skip" {
+			sign = "skip"
+		}
+		fmt.Printf("%s  %s\n", sign, tr.Name)
 	}
 	fmt.Printf("\n%s   всего %s\n", verdict(rep), rep.Elapsed.Round(10*time.Millisecond))
 	if !rep.OK {
+		os.Exit(1)
+	}
+}
+
+// cmdCheckAll прогоняет все уроки подряд. Заменяет прежний «go test ./... из
+// корня»: теперь каждый урок — отдельный модуль, и одной командой их не взять.
+func cmdCheckAll(reg *lesson.Registry, store *progress.Store, workspace string) {
+	failed := 0
+	for _, l := range reg.All {
+		if _, err := l.Unpack(workspace); err != nil {
+			die(err)
+		}
+		rep := runner.Check(context.Background(), runner.Options{
+			Dir:     l.Dir(workspace),
+			AlsoRun: l.Run,
+			Race:    l.Race,
+		})
+		_ = store.Pass(l.ID, rep.OK, rep.Passed, rep.Failed)
+
+		mark := "✓"
+		if !rep.OK {
+			mark = "✗"
+			failed++
+		}
+		score := ""
+		if rep.Passed+rep.Failed > 0 {
+			score = fmt.Sprintf("%d/%d", rep.Passed, rep.Passed+rep.Failed)
+		}
+		fmt.Printf("%s  %-14s %-9s %s\n", mark, l.ID, verdict(rep), score)
+		for _, s := range rep.Steps {
+			for _, p := range s.Problems {
+				fmt.Println("       " + p.String())
+			}
+			if !s.OK && len(s.Problems) == 0 && strings.TrimSpace(s.Output) != "" {
+				fmt.Println(indent(s.Output, "       "))
+			}
+		}
+	}
+	fmt.Printf("\nСдано %d из %d\n", len(reg.All)-failed, len(reg.All))
+	if failed > 0 {
 		os.Exit(1)
 	}
 }
@@ -155,24 +210,9 @@ func runTUI(reg *lesson.Registry, store *progress.Store, workspace string) error
 
 // ---------- вспомогательное ----------
 
-// ensureModule делает из рабочей папки обычный Go-модуль.
-//
-// Без него go test отвечает «go.mod file not found», а с ним студент может
-// выйти из тренажёра и проверить себя руками: go test ./01-basics/
-//
-// go 1.22 — не от жадности: с этой версии переменная цикла создаётся заново
-// на каждой итерации, и урок про горутины на это опирается.
-func ensureModule(workspace string) error {
-	path := filepath.Join(workspace, "go.mod")
-	if _, err := os.Stat(path); err == nil {
-		return nil // студент мог сам поправить зависимости — не трогаем
-	}
-	body := "module golessons\n\ngo 1.22\n"
-	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
-		return fmt.Errorf("не создать %s: %w", path, err)
-	}
-	return nil
-}
+// ensureModule не нужен: каждый урок — самостоятельный модуль, go.mod для него
+// создаёт lesson.Unpack. В корне рабочей папки модуля нет, и это правильно:
+// уроки не должны зависеть друг от друга.
 
 func resolveWorkspace(flagVal string) (string, error) {
 	if flagVal != "" {

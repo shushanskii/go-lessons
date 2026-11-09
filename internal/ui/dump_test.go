@@ -10,9 +10,9 @@ import (
 )
 
 // Не тест по смыслу, а инструмент: пишет экраны в текстовые файлы, чтобы
-// на них можно было посмотреть глазами или сравнить с прошлым снимком.
+// посмотреть их глазами или сравнить с прошлым снимком.
 //
-//	DUMP_DIR=/tmp/shots go test ./internal/ui -run DumpScreen
+//	DUMP_DIR=/tmp/shots go test ./internal/ui -run TestDumpScreen
 //
 // Без DUMP_DIR пропускается.
 func TestDumpScreen(t *testing.T) {
@@ -24,38 +24,33 @@ func TestDumpScreen(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	m, ws := newTestModel(t)
+	m, _ := newTestModel(t)
 	dump(t, dir, "01-list", m)
 
-	updated, _ := m.Update(keyCode(tea.KeyEnter))
-	m = updated.(Model)
-	dump(t, dir, "02-lesson-snippet", m)
+	m = update(t, m, keyCode(tea.KeyEnter)).(Model)
+	dump(t, dir, "02-lesson", m)
 
-	updated, _ = m.Update(keyCode(tea.KeyTab))
-	m = updated.(Model)
-	dump(t, dir, "03-lesson-editing", m)
-
-	updated, _ = m.Update(keyCode(tea.KeyEscape))
-	m = updated.(Model)
 	_, cmd := m.Update(key('r'))
 	if cmd != nil {
-		updated, _ = m.Update(cmd())
-		m = updated.(Model)
+		m = update(t, m, cmd()).(Model)
 	}
-	dump(t, dir, "04-lesson-failing", m)
+	dump(t, dir, "03-lesson-failing", m)
 
-	// Проектный урок с файлами.
-	updated, _ = m.Update(keyCode(tea.KeyEscape))
-	m = updated.(Model)
+	m = update(t, m, keyCode(tea.KeyEscape)).(Model)
 	for i := 0; i < 2; i++ {
-		updated, _ = m.Update(keyCode(tea.KeyDown))
-		m = updated.(Model)
+		m = update(t, m, keyCode(tea.KeyDown)).(Model)
 	}
-	updated, _ = m.Update(keyCode(tea.KeyEnter))
-	m = updated.(Model)
-	dump(t, dir, "05-lesson-project", m)
+	m = update(t, m, keyCode(tea.KeyEnter)).(Model)
+	m = update(t, m, key('3')).(Model)
+	dump(t, dir, "04-lesson-result-pane", m)
 
-	t.Logf("снимки лежат в %s (рабочая папка %s)", dir, ws)
+	// Узкий терминал: проверяем, что раскладка не разваливается.
+	narrow := New(m.reg, m.store, m.workspace)
+	narrow = update(t, narrow, tea.WindowSizeMsg{Width: 80, Height: 24}).(Model)
+	narrow = update(t, narrow, keyCode(tea.KeyEnter)).(Model)
+	dump(t, dir, "05-narrow-80x24", narrow)
+
+	t.Logf("снимки лежат в %s", dir)
 }
 
 func dump(t *testing.T, dir, name string, m Model) {

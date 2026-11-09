@@ -1,8 +1,6 @@
 package ui
 
 import (
-	"fmt"
-
 	"github.com/charmbracelet/x/ansi"
 )
 
@@ -25,11 +23,6 @@ func plural(n int64, one, few, many string) string {
 	default:
 		return many
 	}
-}
-
-// lessonsWord — «1 урок», «2 урока», «5 уроков».
-func lessonsWord(n int) string {
-	return fmt.Sprintf("%d %s", n, plural(int64(n), "урок", "урока", "уроков"))
 }
 
 // wrapTo переносит длинные строки по ширине панели.

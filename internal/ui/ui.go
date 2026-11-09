@@ -6,11 +6,11 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"charm.land/bubbles/v2/spinner"
-	"charm.land/bubbles/v2/textarea"
 	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
@@ -27,21 +27,39 @@ const (
 	screenLesson
 )
 
-type rightTab int
+// pane — панель, которая слушает клавиши прокрутки.
+//
+// Порядок важен: по нему крутится tab.
+type pane int
 
 const (
-	tabCode rightTab = iota
-	tabResult
+	paneTheory pane = iota
+	paneTasks
+	paneResult
 )
 
-// checkDoneMsg приходит из фонового прогона проверок.
-type checkDoneMsg struct {
-	rep *runner.Report
-	err error
+func (p pane) String() string {
+	switch p {
+	case paneTasks:
+		return "задание"
+	case paneResult:
+		return "проверка"
+	default:
+		return "теория"
+	}
 }
 
-// editorDoneMsg приходит, когда студент закрыл внешний редактор.
-type editorDoneMsg struct{ err error }
+var paneOrder = []pane{paneTheory, paneTasks, paneResult}
+
+// Сообщения от фоновых дел.
+type (
+	checkDoneMsg struct{ rep *runner.Report }
+	editorMsg    struct {
+		err error
+		// Target — что открывали: папка урока или файл со строкой.
+		Target string
+	}
+)
 
 // Модель приложения.
 type Model struct {
@@ -58,33 +76,21 @@ type Model struct {
 
 	listVP   viewport.Model
 	theoryVP viewport.Model
-	outVP    viewport.Model
-	ta       textarea.Model
+	tasksVP  viewport.Model
+	resultVP viewport.Model
 	sp       spinner.Model
 
-	right   rightTab
-	editing bool
+	focus   pane
 	running bool
-
-	report *runner.Report
-	notice string // короткое сообщение о последнем действии
+	report  *runner.Report
+	notice  string
 }
 
 // New собирает стартовую модель.
 func New(reg *lesson.Registry, store *progress.Store, workspace string) Model {
 	s := spinner.New()
 	s.Spinner = spinner.Dot
-	s.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("205"))
-
-	ta := textarea.New()
-	ta.SetWidth(60)
-	ta.SetHeight(10)
-	// Нумерацию строк и префикс на каждой строке выключаем: они съедают
-	// колонки, а для Go отступ важнее нумерации — курсор и так показывает, где ты.
-	ta.ShowLineNumbers = false
-	ta.Prompt = " "
-	ta.CharLimit = 0
-	ta.Blur()
+	s.Style = lipgloss.NewStyle().Foreground(cAccent)
 
 	m := Model{
 		reg:       reg,
@@ -92,21 +98,19 @@ func New(reg *lesson.Registry, store *progress.Store, workspace string) Model {
 		workspace: workspace,
 		md:        newMarkdown(),
 		screen:    screenList,
-		ta:        ta,
 		sp:        s,
 		listVP:    viewport.New(),
 		theoryVP:  viewport.New(),
-		outVP:     viewport.New(),
+		tasksVP:   viewport.New(),
+		resultVP:  viewport.New(),
 		notice:    "выбери урок и нажми Enter",
 	}
 	return m
 }
 
-func (m Model) Init() tea.Cmd {
-	return nil
-}
+func (m Model) Init() tea.Cmd { return nil }
 
-// ---------- сообщения ----------
+// ---------- Update ----------
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
@@ -122,42 +126,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, cmd
 
 	case checkDoneMsg:
-		m.running = false
-		if msg.err != nil {
-			m.notice = "проверка не удалась: " + msg.err.Error()
-			return m, nil
-		}
-		m.report = msg.rep
-		m.right = tabResult
-		m.renderOutput()
+		return m.afterCheck(msg.rep)
 
-		id := ""
-		if m.cur != nil {
-			id = m.cur.ID
-			if err := m.store.Pass(id, msg.rep.OK); err != nil {
-				m.notice = "не смог записать прогресс: " + err.Error()
-			}
-		}
-		switch {
-		case msg.rep.Fatal != "":
-			m.notice = msg.rep.Fatal
-		case msg.rep.OK:
-			m.notice = fmt.Sprintf("готово за %s — урок сдан", msg.rep.Elapsed.Round(10*time.Millisecond))
-		case msg.rep.TimedOut:
-			m.notice = "код не завершился за отведённое время"
-		default:
-			m.notice = "проверки красные — читай первую ошибку сверху"
-		}
-		return m, nil
-
-	case editorDoneMsg:
+	case editorMsg:
 		if msg.err != nil {
-			m.notice = "редактор вернул ошибку: " + msg.err.Error()
+			m.notice = fmt.Sprintf("не открылся %s: %v", msg.Target, msg.err)
 		} else {
-			m.notice = "редактор закрыт, нажми r для проверки"
-			m.reloadEditable()
-			m.renderOutput()
+			m.notice = "открыл " + msg.Target + " — правь код и возвращайся на r"
 		}
+		m.reloadTasks()
 		return m, nil
 	}
 
@@ -167,7 +144,40 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m.updateLesson(msg)
 }
 
-// ---------- список уроков ----------
+func (m Model) afterCheck(rep *runner.Report) (tea.Model, tea.Cmd) {
+	m.running = false
+	m.report = rep
+	m.reloadTasks() // код на диске мог измениться, пока шла проверка
+
+	if rep.Fatal != "" {
+		m.notice = rep.Fatal
+		m.renderResult()
+		return m, nil
+	}
+
+	if m.cur != nil {
+		if err := m.store.Pass(m.cur.ID, rep.OK, rep.Passed, rep.Failed); err != nil {
+			m.notice = "не смог записать прогресс: " + err.Error()
+		}
+	}
+
+	switch {
+	case rep.OK:
+		m.notice = fmt.Sprintf("сдано за %s — следующий урок по n",
+			rep.Elapsed.Round(10*time.Millisecond))
+	case rep.TimedOut:
+		m.notice = "код не завершился за отведённое время — похоже на бесконечный цикл или незакрытый канал"
+	case rep.Failed > 0:
+		m.notice = fmt.Sprintf("падают %d %s — g откроет редактор на первой ошибке",
+			rep.Failed, plural(int64(rep.Failed), "тест", "теста", "тестов"))
+	default:
+		m.notice = "проверки красные — читай разбор сверху"
+	}
+	m.renderResult()
+	return m, nil
+}
+
+// ---------- список ----------
 
 func (m Model) updateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if km, ok := msg.(tea.KeyPressMsg); ok {
@@ -177,14 +187,14 @@ func (m Model) updateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "j", "down":
 			if m.idx < len(m.reg.All)-1 {
 				m.idx++
+				m.syncListCursor()
 			}
-			m.syncListCursor()
 			return m, nil
 		case "k", "up":
 			if m.idx > 0 {
 				m.idx--
+				m.syncListCursor()
 			}
-			m.syncListCursor()
 			return m, nil
 		case "enter":
 			return m.openLesson(m.reg.All[m.idx])
@@ -196,10 +206,6 @@ func (m Model) updateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
-// openLesson, startCheck и openEditor — со значением в приёмнике, а не с
-// указателем. Иначе return m отдаёт наружу *Model, и приведение back to Model
-// в вызывающем коде паникует.
-
 func (m Model) openLesson(l *lesson.Lesson) (tea.Model, tea.Cmd) {
 	created, err := l.Unpack(m.workspace)
 	if err != nil {
@@ -209,19 +215,14 @@ func (m Model) openLesson(l *lesson.Lesson) (tea.Model, tea.Cmd) {
 
 	m.cur = l
 	m.screen = screenLesson
-	m.right = tabCode
-	m.editing = false
+	m.focus = paneTheory
 	m.report = nil
 	m.layout()
-	m.reloadEditable()
-	m.setTheory()
 
 	if created {
-		m.notice = "файлы урока лежат в " + l.Dir(m.workspace)
-	} else if l.Kind == lesson.KindSnippet {
-		m.notice = "правь код в поле справа, потом r"
+		m.notice = "урок разложен в " + l.Dir(m.workspace)
 	} else {
-		m.notice = "правь файлы в редакторе (e), потом r"
+		m.notice = "правь " + lesson.FileTasks + " в редакторе, проверяй на r"
 	}
 	return m, nil
 }
@@ -229,50 +230,38 @@ func (m Model) openLesson(l *lesson.Lesson) (tea.Model, tea.Cmd) {
 // ---------- урок ----------
 
 func (m Model) updateLesson(msg tea.Msg) (tea.Model, tea.Cmd) {
-	// В режиме редактирования клавиши принадлежат полю ввода,
-	// кроме Escape, которое из него выводит.
-	if m.editing {
-		if km, ok := msg.(tea.KeyPressMsg); ok && km.String() == "esc" {
-			m.editing = false
-			m.ta.Blur()
-			m.notice = "режим правки выключен"
-			return m, nil
-		}
-		var cmd tea.Cmd
-		m.ta, cmd = m.ta.Update(msg)
-		return m, cmd
-	}
-
+	// Поле ввода в интерфейсе нет, значит любая клавиша свободна: r работает
+	// всегда, независимо от того, на какой панели курсор.
 	if km, ok := msg.(tea.KeyPressMsg); ok {
 		switch km.String() {
 		case "ctrl+c":
 			return m, tea.Quit
+		case "q":
+			return m, tea.Quit
 		case "esc", "backspace":
-			m.cur, m.screen, m.editing = nil, screenList, false
+			m.cur, m.screen = nil, screenList
 			m.layout()
 			m.syncListCursor()
 			m.notice = "назад к списку — выбери следующий урок"
 			return m, nil
 		case "r":
 			return m.startCheck()
-		case "e":
-			return m.openEditor()
-		case "tab":
-			if m.cur.Kind == lesson.KindSnippet {
-				m.editing = true
-				m.right = tabCode
-				return m, m.ta.Focus()
-			}
-			m.toggleTab()
+		case "tab", "l":
+			m.cycleFocus(1)
+			return m, nil
+		case "shift+tab", "h":
+			m.cycleFocus(-1)
 			return m, nil
 		case "1":
-			m.right = tabCode
-			m.renderOutput()
-			return m, nil
+			return m.setFocus(paneTheory)
 		case "2":
-			m.right = tabResult
-			m.renderOutput()
-			return m, nil
+			return m.setFocus(paneTasks)
+		case "3":
+			return m.setFocus(paneResult)
+		case "c":
+			return m.openInVSCode(m.cur.Dir(m.workspace), "папку урока")
+		case "g":
+			return m.gotoProblem()
 		case "n":
 			if m.idx+1 < len(m.reg.All) {
 				m.idx++
@@ -287,70 +276,72 @@ func (m Model) updateLesson(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		case "j", "down":
-			m.scroll(1)
+			m.scrollFocused(1)
 			return m, nil
 		case "k", "up":
-			m.scroll(-1)
+			m.scrollFocused(-1)
 			return m, nil
 		case "pgdown", "f":
-			m.pageDown()
+			m.focused().PageDown()
 			return m, nil
 		case "pgup", "b":
-			m.pageUp()
+			m.focused().PageUp()
 			return m, nil
-		case "home", "g":
-			m.theoryVP.GotoTop()
-			m.outVP.GotoTop()
+		case "home":
+			m.focused().GotoTop()
 			return m, nil
 		case "end", "G":
-			m.theoryVP.GotoBottom()
-			m.outVP.GotoBottom()
+			m.focused().GotoBottom()
 			return m, nil
 		}
 	}
 
+	// Мышь и прочее — в панель под курсором.
 	var cmd tea.Cmd
-	switch m.right {
-	case tabCode:
-		m.theoryVP, cmd = m.theoryVP.Update(msg)
+	switch m.focus {
+	case paneTasks:
+		m.tasksVP, cmd = m.tasksVP.Update(msg)
+	case paneResult:
+		m.resultVP, cmd = m.resultVP.Update(msg)
 	default:
-		m.outVP, cmd = m.outVP.Update(msg)
+		m.theoryVP, cmd = m.theoryVP.Update(msg)
 	}
 	return m, cmd
 }
 
-func (m *Model) toggleTab() {
-	if m.right == tabCode {
-		m.right = tabResult
-	} else {
-		m.right = tabCode
+func (m Model) setFocus(p pane) (tea.Model, tea.Cmd) {
+	m.focus = p
+	if p == paneTasks {
+		m.reloadTasks()
 	}
-	m.renderOutput()
+	return m, nil
 }
 
-func (m *Model) scroll(n int) {
-	if m.right == tabCode {
-		m.theoryVP.ScrollDown(n)
-	} else {
-		m.outVP.ScrollDown(n)
+func (m *Model) cycleFocus(step int) {
+	for i, p := range paneOrder {
+		if p == m.focus {
+			n := (i + step + len(paneOrder)) % len(paneOrder)
+			m.focus = paneOrder[n]
+			break
+		}
 	}
-}
-
-func (m *Model) pageDown() {
-	if m.right == tabCode {
-		m.theoryVP.PageDown()
-	} else {
-		m.outVP.PageDown()
+	if m.focus == paneTasks {
+		m.reloadTasks()
 	}
 }
 
-func (m *Model) pageUp() {
-	if m.right == tabCode {
-		m.theoryVP.PageUp()
-	} else {
-		m.outVP.PageUp()
+func (m *Model) focused() *viewport.Model {
+	switch m.focus {
+	case paneTasks:
+		return &m.tasksVP
+	case paneResult:
+		return &m.resultVP
+	default:
+		return &m.theoryVP
 	}
 }
+
+func (m *Model) scrollFocused(n int) { m.focused().ScrollDown(n) }
 
 // startCheck запускает проверки фоном: интерфейс не должен замирать
 // на полсекунды, пока идёт сборка.
@@ -363,20 +354,9 @@ func (m Model) startCheck() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	// Поле ввода — источник правды для snippet-урока: сначала сохраняем.
-	if m.cur.Kind == lesson.KindSnippet {
-		if err := m.cur.WriteEditable(m.workspace, m.ta.Value()); err != nil {
-			m.notice = "не смог сохранить код: " + err.Error()
-			return m, nil
-		}
-	}
-
 	m.running = true
-	m.editing = false
-	m.ta.Blur()
 	m.notice = "проверяю…"
-	m.right = tabResult
-	m.renderOutput()
+	m.renderResult()
 
 	dir := m.cur.Dir(m.workspace)
 	wantRun, wantRace := m.cur.Run, m.cur.Race
@@ -390,41 +370,133 @@ func (m Model) startCheck() (tea.Model, tea.Cmd) {
 	}
 }
 
-// openEditor отдаёт папку урока внешнему редактору через $EDITOR.
-func (m Model) openEditor() (tea.Model, tea.Cmd) {
-	if m.cur == nil {
-		return m, nil
-	}
-	ed := os.Getenv("EDITOR")
-	if ed == "" {
-		ed = os.Getenv("VISUAL")
-	}
-	if ed == "" {
-		m.notice = "переменная EDITOR не задана — скажи редактору открыться самому: " + m.cur.Dir(m.workspace)
-		return m, nil
-	}
+// ---------- VS Code ----------
 
-	// Редактор перехватывает терминал, поэтому в него идёт сразу папка урока.
-	argv := strings.Fields(ed)
-	cmd := exec.Command(argv[0], append(argv[1:], m.cur.Dir(m.workspace))...)
-	m.editing = false
-	m.ta.Blur()
-	return m, tea.ExecProcess(cmd, func(err error) tea.Msg {
-		return editorDoneMsg{err: err}
-	})
+// openInVSCode открывает путь в VS Code.
+//
+// Не ждём завершения: code обычно возвращает управление сразу, и ждать его —
+// значит подвесить интерфейс.
+func (m Model) openInVSCode(path, what string) (tea.Model, tea.Cmd) {
+	bin, args, err := editorCommand(nil, path)
+	if err != nil {
+		m.notice = err.Error() + " — путь лежит в " + path
+		return m, nil
+	}
+	m.notice = "открываю " + what + "…"
+	return m, spawnEditor(bin, args, what)
 }
 
-func (m *Model) reloadEditable() {
-	if m.cur == nil || m.cur.Kind != lesson.KindSnippet {
-		return
+// gotoProblem уводит редактор ровно на ту строку, где всё сломалось.
+func (m Model) gotoProblem() (tea.Model, tea.Cmd) {
+	p := m.firstProblem()
+	if p == nil {
+		m.notice = "пока не на что указывать: запусти проверку на r"
+		return m, nil
 	}
-	src, err := m.cur.ReadEditable(m.workspace)
+
+	// Go печатает путь относительно папки урока.
+	full := p.File
+	if !filepath.IsAbs(full) {
+		full = filepath.Join(m.cur.Dir(m.workspace), p.File)
+	}
+	if _, err := os.Stat(full); err != nil {
+		m.notice = "файл " + p.File + " не найден — возможно, его переименовали"
+		return m, nil
+	}
+
+	bin, args, err := editorCommand([]string{"--goto"}, full)
 	if err != nil {
-		m.notice = "не смог прочитать код: " + err.Error()
+		m.notice = err.Error() + " — ошибка лежит в " + p.String()
+		return m, nil
+	}
+	if p.Line > 0 {
+		args = append(args, fmt.Sprintf("%s:%d", full, p.Line))
+	} else {
+		args = append(args, full)
+	}
+
+	m.notice = "открываю " + p.Location()
+	return m, spawnEditor(bin, args, p.Location())
+}
+
+// firstProblem — куда смотреть в первую очередь.
+func (m Model) firstProblem() *runner.Problem {
+	if m.report == nil {
+		return nil
+	}
+
+	// Сначала не-тест: студент чинит свой код, а не проверку. Тест упоминаем
+	// только когда в его коде указывать не на что.
+	var fallback *runner.Problem
+
+	// С шагами идём с конца: тесты важнее разбора, который часто ругается
+	// на то же место общими словами.
+	for i := len(m.report.Steps) - 1; i >= 0; i-- {
+		probs := m.report.Steps[i].Problems
+		for j := range probs {
+			p := &probs[j]
+			if !strings.HasSuffix(p.File, "_test.go") {
+				return p
+			}
+			if fallback == nil {
+				fallback = p
+			}
+		}
+	}
+	return fallback
+}
+
+// editorCommand собирает запуск редактора: сначала VS Code, потом $EDITOR.
+func editorCommand(extra []string, path string) (string, []string, error) {
+	if bin, err := exec.LookPath("code"); err == nil {
+		args := append(append([]string{}, extra...), path)
+		return bin, args, nil
+	}
+	if ed := os.Getenv("EDITOR"); ed != "" {
+		argv := strings.Fields(ed)
+		return argv[0], append(append(argv[1:], extra...), path), nil
+	}
+	if ed := os.Getenv("VISUAL"); ed != "" {
+		argv := strings.Fields(ed)
+		return argv[0], append(append(argv[1:], extra...), path), nil
+	}
+	return "", nil, fmt.Errorf("не нашёл редактор: нет ни code, ни EDITOR")
+}
+
+func spawnEditor(bin string, args []string, target string) tea.Cmd {
+	return func() tea.Msg {
+		cmd := exec.Command(bin, args...)
+		if err := cmd.Start(); err != nil {
+			return editorMsg{err: err, Target: target}
+		}
+		// Дожидаемся в этой же горутине, чтобы не оставить зомби-процесс.
+		_ = cmd.Wait()
+		return editorMsg{err: nil, Target: target}
+	}
+}
+
+// ---------- содержимое панелей ----------
+
+func (m *Model) reloadTasks() {
+	if m.cur == nil || m.width == 0 {
 		return
 	}
-	m.ta.SetValue(src)
-	m.ta.CursorEnd()
+	src, err := m.cur.Read(m.workspace, lesson.FileTasks)
+	if err != nil {
+		m.tasksVP.SetContent("нет файла " + lesson.FileTasks + ":\n" + err.Error())
+		return
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s\n\n", styleMuted.Render(m.cur.Dir(m.workspace)))
+	b.WriteString(src)
+
+	if tests, err := m.cur.Read(m.workspace, lesson.FileTests); err == nil {
+		b.WriteString("\n\n")
+		b.WriteString(styleMuted.Render("── "+lesson.FileTests+" — их лучше не трогать ──") + "\n")
+		b.WriteString(tests)
+	}
+	m.tasksVP.SetContent(wrapTo(b.String(), m.tasksVP.Width()))
 }
 
 // ---------- раскладка ----------
@@ -434,11 +506,11 @@ func (m *Model) layout() {
 		return
 	}
 	const (
-		border = 2 // рамки слева и справа
+		border = 2 // левая и правая рамки
 		pad    = 2 // внутренние отступы
-		chrome = 2 // шапка и подвал
+		chrome = 3 // шапка, подсказка, подвал
 	)
-	bodyH := max(m.height-chrome, 3)
+	bodyH := max(m.height-chrome, 5)
 	inner := max(bodyH-border, 1)
 
 	if m.screen == screenList {
@@ -448,18 +520,25 @@ func (m *Model) layout() {
 		return
 	}
 
-	leftW := m.width * 52 / 100
+	leftW := m.width * 46 / 100
 	rightW := m.width - leftW
+	tasksH := max(bodyH*32/100, 6)
+	resultH := max(bodyH-tasksH, 4)
 
 	m.theoryVP.SetWidth(leftW - border - pad)
 	m.theoryVP.SetHeight(inner)
-	m.outVP.SetWidth(rightW - border - pad)
-	m.outVP.SetHeight(inner)
-	m.ta.SetWidth(rightW - border - pad - 2)
-	m.ta.SetHeight(inner)
+
+	tasksInner := max(tasksH-border, 1)
+	resultInner := max(resultH-border, 1)
+
+	m.tasksVP.SetWidth(rightW - border - pad)
+	m.tasksVP.SetHeight(tasksInner)
+	m.resultVP.SetWidth(rightW - border - pad)
+	m.resultVP.SetHeight(resultInner)
 
 	m.setTheory()
-	m.renderOutput()
+	m.reloadTasks()
+	m.renderResult()
 }
 
 func (m *Model) setTheory() {
@@ -475,7 +554,6 @@ func (m *Model) setTheory() {
 }
 
 func (m *Model) syncListCursor() {
-	// Держим выделенную строку в поле видимости списка.
 	off := m.idx
 	if h := m.listVP.Height(); h > 0 && off >= m.listVP.YOffset()+h {
 		m.listVP.SetYOffset(off - h + 1)

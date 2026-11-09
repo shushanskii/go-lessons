@@ -1,5 +1,3 @@
 title: Горутины, каналы и WaitGroup
-kind: project
 run: yes
 race: yes
-hint: main.go
